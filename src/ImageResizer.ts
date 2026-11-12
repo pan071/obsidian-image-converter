@@ -743,7 +743,7 @@ export class ImageResizer extends Component {
                 return;
             }
 
-            if (resolvedImageTarget && !this.isExternalLink(resolvedImageTarget.src)) {
+            if (resolvedImageTarget && this.canUseResizeHandles(resolvedImageTarget)) {
                 if (this.activeImage === resolvedImageTarget && this.handles.length > 0) {
                     return;
                 }
@@ -780,7 +780,8 @@ export class ImageResizer extends Component {
         if (this.resizeState.isResizing) return;
 
         // Handle external images: add a border and perform edge detection for cursor change
-        if (target.instanceOf(HTMLImageElement) && this.isExternalLink(target.src)) {
+        // 仅在无法安全包裹手柄容器的远程图片上保留边框拖拽模式
+        if (target.instanceOf(HTMLImageElement) && !this.canUseResizeHandles(target)) {
             if (this.activeImage === target && target.hasClass("image-resize-border")) {
                 // Already active; just update edge detection
                 this.handleEdgeDetection(event, target);
@@ -793,7 +794,8 @@ export class ImageResizer extends Component {
         }
 
         // Handle internal images: create resize handles
-        if (target.instanceOf(HTMLImageElement) && !this.isExternalLink(target.src)) {
+        // 本地图片与位于图片组件内的远程图片都使用四角手柄
+        if (target.instanceOf(HTMLImageElement) && this.canUseResizeHandles(target)) {
             // If this image already has a container/handles, do nothing
             const container = target.matchParent(".image-resize-container");
             if (this.activeImage === target && this.handles.length > 0 && container) {
@@ -2163,6 +2165,25 @@ export class ImageResizer extends Component {
      */
     private isExternalLink(imageName: string): boolean {
         return imageName.startsWith("http://") || imageName.startsWith("https://");
+    }
+
+    /**
+     * 判断图片能否使用四角手柄缩放。
+     *
+     * 手柄需要把图片包进 .image-resize-container，若图片直接位于编辑器正文行内，
+     * 包裹会改动编辑器正文 DOM，因此上游对远程图片一律改用边框拖拽。
+     * Obsidian 1.x 的 Live Preview 中远程图片同样渲染在 .image-embed 组件内，包裹只发生在组件内部；
+     * 阅读视图不在编辑器正文内。这两种情况远程图片也可以安全使用手柄。
+     *
+     * @param image - 待缩放的图片元素
+     * @returns 可以使用四角手柄时返回 true，否则返回 false 并回退为边框拖拽
+     */
+    private canUseResizeHandles(image: HTMLImageElement): boolean {
+        // 本地图片沿用上游行为，始终使用手柄
+        if (!this.isExternalLink(image.src)) return true;
+
+        // 远程图片位于图片组件内，或不在编辑器正文内（阅读视图）时可以使用手柄
+        return Boolean(image.matchParent(".image-embed")) || !image.matchParent(".cm-content");
     }
 
     /**
