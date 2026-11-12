@@ -150,8 +150,9 @@ export class ImageAlignment extends Component {
      * Applies alignment styles to an image based on cached data. THIS is called from ImageAlignmentManager!
      * @param img - The target image element.
      * @param positionData - The cached alignment data.
+     * @param applySize - 是否同时把缓存中的宽高写回图片内联样式；图片重绘补样式时传 false，以链接中的尺寸为准
      */
-    public applyAlignmentToImage(img: HTMLImageElement, positionData: ImagePositionData) {
+    public applyAlignmentToImage(img: HTMLImageElement, positionData: ImagePositionData, applySize = true) {
         if (!positionData) {
             console.error("No position data provided for image:", img.src);
             return;
@@ -159,7 +160,8 @@ export class ImageAlignment extends Component {
 
         // Always apply alignment, do not skip based on current alignment
         // Parent embed handling
-        const parentEmbed = img.matchParent('.internal-embed.image-embed'); // Use matchParent
+        // 远程图片的外层容器只有 .image-embed，没有 .internal-embed，统一按 .image-embed 查找，否则远程图片无法居中
+        const parentEmbed = img.matchParent('.image-embed');
         if (parentEmbed) {
             // Remove each class token individually to match DOMTokenList semantics
             parentEmbed.removeClass('image-position-left');
@@ -191,10 +193,11 @@ export class ImageAlignment extends Component {
             img.addClass(positionData.wrap ? 'image-wrap' : 'image-no-wrap');
 
             // Ensure width is applied
-            if (positionData.width) {
+            // 重绘补样式时跳过尺寸，避免缓存中的旧宽高覆盖链接里的新尺寸
+            if (applySize && positionData.width) {
                 img.setCssStyles({ width: positionData.width });
             }
-            if (positionData.height) {
+            if (applySize && positionData.height) {
                 img.setCssStyles({ height: positionData.height });
             }
 
@@ -232,7 +235,8 @@ export class ImageAlignment extends Component {
         }
 
         // --- Apply Visual Changes to PARENT SPAN ---
-        const parentEmbed = img.matchParent('.internal-embed.image-embed');
+        // 与 applyAlignmentToImage 保持一致，远程图片的外层容器同样需要加上对齐类
+        const parentEmbed = img.matchParent('.image-embed');
         if (parentEmbed) {
             parentEmbed.removeClass('image-position-left');
             parentEmbed.removeClass('image-position-center');

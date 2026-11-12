@@ -50,6 +50,10 @@ export class ImageAlignmentManager {
 	public lock = new AsyncLock();
 	private imageStates: Map<string, ImageAlignmentOptions> = new Map();
 	private eventRefs: EventRef[] = [];
+	/** 图片重绘监听器，每个窗口一个，卸载时统一断开 */
+	private renderObservers: MutationObserver[] = [];
+	/** 工作区事件引用（如弹出窗口打开），需通过 workspace.offref 注销 */
+	private workspaceEventRefs: EventRef[] = [];
 	private cleanupIntervalId: number | null = null;
 	debouncedValidateNoteCache: Debouncer<
 		[notePath: string, noteContent: string],
@@ -79,6 +83,8 @@ export class ImageAlignmentManager {
 	public async initialize() {
 		await this.loadCache();
 		this.registerEvents();
+		// 图片组件重建后自动补回对齐样式
+		this.setupRenderObserver();
 		// this.setupIsmageObserver(); // STILL needed for managing images inside callouts etc
 		this.scheduleCacheCleanup();
 
@@ -288,6 +294,138 @@ export class ImageAlignmentManager {
 		//         }
 		//     })
 		// );
+	}
+
+	/**
+	 * 监听工作区内新渲染出的图片，按对齐缓存补回对齐样式。
+	 *
+	 * Live Preview 中的图片组件在链接改动、缩放写回尺寸后会整体重建，新建的图片元素不带对齐类；
+	 * 原先只在打开笔记、布局变化、点击对齐菜单后重新应用，重建后的远程图片会丢失居中等样式。
+	 * 回调只做元素过滤和缓存查找，不加锁、不读写磁盘，开销很小。
+	 */
+	private setupRenderObserver(): void {
+		// 监听主窗口工作区
+		this.observeRenderRoot(this.app.workspace.containerEl);
+
+		// 弹出窗口打开时，同样监听其文档
+		this.workspaceEventRefs.push(
+			this.app.workspace.on("window-open", (win) => {
+				this.observeRenderRoot(win.doc.body);
+			})
+		);
+	}
+
+	/**
+	 * 在指定根节点上创建图片重绘监听器。
+	 *
+	 * @param root 需要监听的根节点，为空时忽略
+	 */
+	private observeRenderRoot(root: HTMLElement | null | undefined): void {
+		// 根节点不存在时无需监听
+		if (!root) return;
+
+		const observer = new MutationObserver((mutations) => {
+			this.handleRenderMutations(mutations);
+		});
+		// childList 捕获组件重建，src 属性变化捕获先插入后赋值地址的图片
+		observer.observe(root, {
+			childList: true,
+			subtree: true,
+			attributes: true,
+			attributeFilter: ["src"],
+		});
+		this.renderObservers.push(observer);
+	}
+
+	/**
+	 * 处理一批 DOM 变化，找出新渲染或地址变化的图片并补回对齐样式。
+	 *
+	 * @param mutations MutationObserver 回调收到的变化记录
+	 */
+	private handleRenderMutations(mutations: MutationRecord[]): void {
+		// 没有任何对齐记录时直接跳过，避免无谓遍历
+		if (Object.keys(this.cache).length === 0) return;
+
+		// 缩放进行中由缩放器维护样式，此时不介入
+		const resizeState = this.plugin.imageResizer?.resizeState;
+		if (resizeState?.isResizing || resizeState?.isScrolling) return;
+
+		for (const mutation of mutations) {
+			// 图片地址变化：直接处理目标图片
+			if (mutation.type === "attributes") {
+				const target = mutation.target as HTMLElement;
+				if (target.tagName === "IMG") {
+					this.applyCachedAlignmentToRenderedImage(target as HTMLImageElement);
+				}
+				continue;
+			}
+
+			// 新增节点：节点本身或其内部的图片都需要处理
+			mutation.addedNodes.forEach((node) => {
+				// 文本等非元素节点不可能包含图片
+				if (node.nodeType !== Node.ELEMENT_NODE) return;
+				const element = node as HTMLElement;
+
+				if (element.tagName === "IMG") {
+					this.applyCachedAlignmentToRenderedImage(element as HTMLImageElement);
+					return;
+				}
+
+				// 整个图片组件被重建时，图片位于新增节点内部
+				const images = element.getElementsByTagName("img");
+				for (let index = 0; index < images.length; index++) {
+					this.applyCachedAlignmentToRenderedImage(images[index]);
+				}
+			});
+		}
+	}
+
+	/**
+	 * 为一张新渲染的图片补回缓存中的对齐样式，不改动图片尺寸。
+	 *
+	 * @param img 新渲染或地址变化的图片元素
+	 */
+	private applyCachedAlignmentToRenderedImage(img: HTMLImageElement): void {
+		// 已带对齐类说明样式仍在（如缩放手柄容器移动了图片），无需重复处理
+		if (img.hasClass("image-converter-aligned")) return;
+
+		// 没有地址的图片（如编辑器占位元素）无法计算缓存键
+		const src = img.getAttr("src");
+		if (!src) return;
+
+		// 先定位所属笔记，笔记没有对齐记录时不必计算哈希
+		const notePath = this.findNotePathForElement(img);
+		if (!notePath || !this.cache[notePath]) return;
+
+		// 按与右键菜单相同的规则计算缓存键并读取对齐记录
+		const positionData = this.cache[notePath][this.getImageHash(notePath, src)];
+		if (!positionData || positionData.position === "none") return;
+
+		// 只补对齐类，尺寸以链接中的写法为准
+		this.imageAlignment.applyAlignmentToImage(img, positionData, false);
+	}
+
+	/**
+	 * 查找元素所在视图对应的笔记路径。
+	 *
+	 * @param element 视图内的任意元素
+	 * @returns 笔记路径，元素不在任何视图中时返回 null
+	 */
+	private findNotePathForElement(element: HTMLElement): string | null {
+		let notePath: string | null = null;
+
+		this.app.workspace.iterateAllLeaves?.((leaf) => {
+			// 已找到时跳过剩余视图
+			if (notePath) return;
+
+			// 视图容器包含该元素，即为图片所在的笔记
+			const leafLike = leaf as unknown as WorkspaceLeafLike;
+			if (leafLike.view?.containerEl?.contains(element)) {
+				notePath = this.getLeafNotePath(leafLike);
+			}
+		});
+
+		return notePath;
 	}
 
 	// setupImageObserver() {
@@ -893,6 +1031,16 @@ export class ImageAlignmentManager {
 			this.imageObserver.disconnect();
 			this.imageObserver = null;
 		}
+
+		// 断开所有图片重绘监听器
+		this.renderObservers.forEach((observer) => observer.disconnect());
+		this.renderObservers = [];
+
+		// 注销弹出窗口等工作区事件
+		this.workspaceEventRefs.forEach((eventRef) => {
+			this.app.workspace.offref(eventRef);
+		});
+		this.workspaceEventRefs = [];
 	}
 
 	onunload() {
